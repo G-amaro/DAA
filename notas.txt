@@ -1,1 +1,234 @@
-parolões
+=====================================================================
+PROJETO DAA - PREVISÃO DE AGE_RANGE (EHIS PORTUGAL 2019) - Estimativa lol 
+Registo das implementações, descobertas e decisões
+=====================================================================
+
+ÍNDICE
+   1. Dados e objetivo
+   2. Análise exploratória (gráficos iniciais)
+   3. Baseline: o que inclui e porquê
+   4. Evolução dos resultados
+   5. Descoberta: estrutura do WGT
+   6. Discussão: o WGT é leakage?
+   7. Plano com dois modelos
+   8. Próximos passos
+
+---------------------------------------------------------------------
+1. DADOS E OBJETIVO
+---------------------------------------------------------------------
+- Treino: 10962 linhas x 238 colunas. Teste: 3655 linhas x 237 colunas.
+- Alvo: AGE_RANGE, 16 classes (0 a 15). Métrica: Macro F1.
+- HHID: 0 agregados em comum entre treino e teste, e 10962 HHID únicos em
+  10962 linhas. Cada agregado tem uma só pessoa no treino, por isso não há
+  labels de familiares a explorar, e o CV agrupado por HHID equivale a um CV
+  estratificado normal.
+- Flag 55+: a pergunta PC1A (cuidados pessoais) só se aplica a quem tem 55+.
+  A tabela cruzada flag 55+ vs classe>=9 no treino é perfeitamente diagonal
+  (4877 pessoas com classe 0-8, 6085 com classe 9-15). Isto permite treinar
+  um modelo para cada metade ("por metades").
+- O enunciado pede também: (a) identificar anomalias epidemiológicas (casos
+  em que a idade estimada pelo modelo se afasta muito da declarada) e (b)
+  caracterizar cada grupo etário ao nível socioeconómico e de saúde. A lista
+  de variáveis do enunciado NÃO inclui o WGT.
+
+---------------------------------------------------------------------
+2. ANÁLISE EXPLORATÓRIA (GRÁFICOS INICIAIS)
+---------------------------------------------------------------------
+2.1 Distribuição do alvo (1_alvo.png)
+   - Desbalanceada. Pico nas classes 9-12 (~1000 pessoas cada). Classes 0
+     e 1 com ~200 e ~170, e classe 15 com ~500.
+   - Consequência: usar class_weight="balanced" e olhar para o Macro F1,
+     não para a exatidão.
+
+2.2 Aplicabilidade dos blocos por classe (2_blocos_aplicabilidade.png)
+   - PC1A (cuidados pessoais) aplica-se em 100% a partir da classe 9 e em
+     0% antes. HA1A (tarefas domésticas) aplica-se em ~92% a partir da 9.
+   - HA2 (ajuda em tarefas domésticas) sobe de ~20% (classe 9) para ~80%
+     (classe 15).
+   - Trabalha (JOBISCO_COD) sobe até ~87% na classe 5 e cai para ~0 a partir
+     da 12.
+   - Tabaco (IN45) e álcool (AL2) têm aplicabilidade pouco informativa.
+   - Conclusão: o padrão de "Não aplicável" é sinal, e a flag 55+ separa
+     <9 de >=9 sem erro.
+
+2.3 MAINSTAT por classe (3_mainstat.png)
+   - Classes 0-1: aluno. Classes 3-9: empregado. A partir da 11: reformado
+     (~70% na 11, ~90% de 12 em diante). Desempregado e incapacitado
+     ocupam fatias pequenas nas idades intermédias.
+
+2.4 Saúde por classe (4_saude_por_classe.png)
+   - Saúde percebida HS1 (1-5): desce de ~4.3 (classe 0-1) para ~2.6 (15).
+   - Limitação HS3: sobe de ~0.05 para ~1.05.
+   - Problema de longa duração HS2: de ~20% (classe 1) para ~88% (14).
+   - IMC: sobe de ~22.5 até ~27.5 (classe 11) e volta a descer (~25.7 na 15).
+   - Nº de doenças crónicas (CD1A-P): de ~0.5 para ~4.4 (classe 14).
+
+2.5 Doenças crónicas por classe (5_doencas_cronicas.png)
+   - CD1E, CD1G e CD1H sobem para ~60% nas classes 13-15.
+   - CD1I e CD1P sobem de forma moderada (~40-55%). CD1K é mais frequente
+     nas classes mais jovens (~30% na classe 0).
+
+2.6 Peso amostral por classe (6_wgt.png)
+   - A mediana de log10(WGT) desce de ~2.8 (classes jovens) para ~2.3
+     (classes velhas). O WGT tem tendência com a idade. Foi o primeiro
+     indício do que viria a explicar o salto de desempenho.
+
+2.7 Informação mútua global (7_informacao_mutua.png)
+   - Topo (0.69-0.74): HA1A-G, PC1A-E, IN15. Dizem quase só "classe <9 ou
+     >=9". O MAINSTAT tem 0.60.
+   - A seguir, ~0.30-0.33: HH_ACT, JOBSTAT_COD, LOCNACE_COD, JOBISCO_COD,
+     IN60, FT_PT, AW1; depois MARSTALEGAL (0.29), HHTYPE, HATLEVEL.
+   - COUNTRY e PROXY têm MI 0.
+
+2.8 Quotas por classe: amostra vs ponderada (8_quotas_ponderadas.png)
+   - Com os pesos, as classes 0-7 pesam mais que na amostra (a população
+     jovem está sub-representada na amostra) e as 9-15 pesam menos. É uma
+     segunda prova de que WGT e idade estão ligados.
+
+2.9 Informação mútua condicional (9_mi_condicional.png)
+   - Dentro das classes 0-8 (n=4877): MAINSTAT 0.256, MARSTALEGAL 0.208,
+     IN24 0.194, PARTNERS 0.169, PA7_NAC 0.154, JOBSTAT_COD 0.154,
+     HATLEVEL 0.152.
+   - Dentro das classes 9-15 (n=6085): MAINSTAT 0.304, LOCNACE_COD 0.205,
+     JOBSTAT_COD 0.202, JOBISCO_COD 0.201, AW1/FT_PT/IN60 ~0.198, HH_ACT
+     0.192.
+   - Conclusão: dentro de cada metade, o sinal por feature é baixo (<0.3).
+     Distinguir 40 de 45 anos, ou 70 de 75, é difícil só com o questionário.
+
+---------------------------------------------------------------------
+3. BASELINE: O QUE INCLUI E PORQUÊ
+---------------------------------------------------------------------
+Limpeza e features
+- "Sem resposta" e "Não aplicável" -> NaN; mapeamento de Sim/Não, escalas
+  ordinais (dicionário ESCALAS), numéricas e categóricas.
+- Features criadas: IMC, nº de doenças, ADL (PC1A-E), IADL (HA1A-G), índice
+  de fragilidade, flags aplica_55mais e trabalha.
+- PROXY incluído como feature (inicialmente era descartado).
+
+Modelo e validação
+- LightGBM com class_weight="balanced". Parâmetros regularizados:
+  num_leaves 15, min_child_samples 40, colsample_bytree 0.4, reg_lambda 5,
+  cat_smooth 50, min_data_per_group 100, cat_l2 10, 400 árvores, lr 0.04.
+- CV: 5 folds (StratifiedGroupKFold por HHID), previsões out-of-fold.
+- Duas formas de classificar: um classificador único (16 classes) e um
+  classificador por metade (<55 / 55+), esta última com melhor Macro F1.
+- Opção de média de várias seeds.
+
+Features de desenho amostral (a partir do WGT)
+- logwgt: log do peso.
+- wgt_rel: log WGT menos a média da célula NUTS2_AG|SEX|DEG_URB.
+- wgt_rank_cel: percentil do peso dentro da célula.
+- wgt_dup: quantas pessoas partilham exatamente o mesmo WGT.
+- Calculadas sobre treino+teste, sem usar o alvo.
+
+Codificação por WGT (vizinhos de peso)
+- Para cada pessoa, distribuição de classes das OUTRAS pessoas do treino com
+  exatamente o mesmo WGT: viz_n, viz_media, viz_min, viz_max, viz_std.
+- Sem vazamento do alvo: nas linhas de validação/teste só se usam labels do
+  treino do fold, e nas linhas de treino usam-se folds internos (a própria
+  linha nunca entra no seu cálculo).
+- Teste de sanidade: com labels sem relação com o WGT, o macro F1 fica
+  perto do acaso (~0.09 com 16 classes), ou seja, o código não infla a
+  métrica.
+
+Alternativas testadas e descartadas
+- Regressão com cortes otimizados para Macro F1: era a melhor sem WGT
+  (0.4770), mas os cortes eram ajustados nas próprias previsões OOF
+  (otimista) e perdeu para a classificação assim que o WGT entrou.
+- Classe esperada (média ponderada das probabilidades): pior que o argmax.
+- Multiplicadores por classe sobre as probabilidades, otimizados para Macro
+  F1 e avaliados de forma honesta (ajustados numa metade das OOF e
+  avaliados na outra): sem ganho, empate ou ligeiramente pior.
+
+---------------------------------------------------------------------
+4. EVOLUÇÃO DOS RESULTADOS (macro F1, CV out-of-fold)
+---------------------------------------------------------------------
+Configuração do baseline                          Melhor variante   Macro F1
+Sem WGT, parâmetros iniciais                      reg. por metades  0.4770
+   -> score no Kaggle (primeira submissão)                          0.45
++ WGT como feature                                cls. por metades  0.5861
++ features de desenho amostral, PROXY e           cls. por metades  0.6356
+  parâmetros regularizados
++ codificação por WGT (vizinhos de peso)          cls. por metades  0.8086
+
+F1 por classe:
+- Sem WGT (reg. por metades): classes do meio 3-7 em 0.34-0.40 e 12-14 em
+  0.35-0.43.
+- Com features de desenho amostral: classes 9-15 em ~0.75-0.80; 1 e 3-7
+  em 0.40-0.47.
+- Com vizinhos de WGT: 0.85 (classe 0), 0.66 (1), 0.79 (2), 0.66-0.70
+  (3-5), 0.75-0.78 (6-7), 0.85 (8), 0.87-0.91 (9-15).
+
+Importância das features com vizinhos de WGT (ganho): viz_media 23.2%,
+viz_min 15.7%, viz_max 11.7%, MAINSTAT 5.4%, iadl_soma 2.3%. Mais de metade
+do ganho vem dos vizinhos de WGT. Cobertura: 73.5% das linhas do teste têm
+o mesmo WGT de alguma pessoa do treino. A distribuição das previsões no
+teste bate certo com a do treino.
+Esperado no Kaggle: ~0.79-0.82.
+
+---------------------------------------------------------------------
+5. DESCOBERTA: ESTRUTURA DO WGT
+---------------------------------------------------------------------
+Resultados no conjunto treino+teste (14617 linhas):
+- 5372 valores únicos de WGT.
+- Tamanho dos grupos (nº de pessoas com o mesmo WGT -> nº de valores):
+    1 pessoa: 3423   2: 762   3: 363   4: 201   5: 140   6: 104
+    7: 62   8: 46   9: 34   10: 21   11: 22   12: 17   13: 20
+    14: 13   15: 11   ...
+- 1553 grupos com mais de 1 pessoa no treino.
+- Amplitude de classes dentro de cada grupo (max - min):
+    média 0.052, mediana 0, percentil 75 = 0, máximo 10.
+  Quase todos os grupos têm uma só classe de idade. Quem tem o mesmo WGT
+  tem (quase sempre) a mesma classe.
+- Figura: wgt_estrutura.png (tamanho dos grupos e amplitude de classes por
+  grupo).
+Explicação provável: o peso é calculado por célula de calibração (idade x
+sexo x região), logo a idade entra na sua construção.
+
+---------------------------------------------------------------------
+6. DISCUSSÃO: O WGT É LEAKAGE?
+---------------------------------------------------------------------
+- Não é um erro de validação nem overfitting no sentido clássico: o CV está
+  bem montado e o WGT existe também no teste, vindo do mesmo inquérito.
+  O ganho deve transferir-se para o Kaggle.
+- É leakage em sentido lato / "atalho": o WGT é calculado pelo instituto de
+  estatística para a amostra reproduzir a população por idade, sexo e
+  região. A idade entra na sua construção, logo é um derivado do alvo. A
+  codificação por vizinhos de WGT faz quase uma consulta direta ao rótulo.
+- Consequências:
+    * o score com WGT mede o atalho, não o que o modelo aprendeu sobre
+      saúde e perfil;
+    * um modelo assim não generaliza a pessoas de outro inquérito;
+    * a parte de anomalias epidemiológicas (idade estimada vs declarada)
+      fica contaminada pelo WGT;
+    * o WGT não consta da lista de variáveis do enunciado.
+- Decisão pendente: confirmar com o professor / regras do Kaggle se o WGT
+  pode ser usado.
+
+---------------------------------------------------------------------
+7. PLANO COM DOIS MODELOS
+---------------------------------------------------------------------
+A- Modelo "legítimo": baseline sem WGT (e, por isso, sem vizinhos de WGT).
+   Usar para a caracterização dos grupos e para a análise de anomalias
+   (classe esperada e desvio das previsões OOF). Expectativa: CV ~0.48-0.50.
+B- Modelo "competição": baseline com WGT e vizinhos, só para a submissão do
+   Kaggle, com a limitação descrita no relatório.
+No relatório, apresentar o score de A como qualidade do modelo e o de B
+como resultado da competição, explicando a origem do atalho.
+
+---------------------------------------------------------------------
+8. PRÓXIMOS PASSOS
+---------------------------------------------------------------------
+ 1. Confirmar a regra do WGT (professor / Kaggle).
+ 2. Correr o baseline sem WGT e guardar a tabela de resultados.
+ 3. Mapear categóricas ordinais (alimentação, exercício, apoio social,
+    álcool) e acrescentá-las a ESCALAS, a partir da lista de valores das
+    categóricas.
+ 4. Cruzamentos de coorte: HATLEVEL x MAINSTAT x MARSTALEGAL x
+    HHNBPERS_0_13_COD, e "ainda trabalha" nos 55+.
+ 5. Classificação ordinal (15 binários P(y>k)) e média de seeds.
+ 6. Seleção de features por metade com a informação mútua condicional.
+ 7. Reportar o macro F1 separado por linhas com e sem vizinho de WGT
+    (parte "honesta" vs "de atalho").
+ 8. Análise de anomalias: pessoas com |desvio| grande entre classe esperada
+    e classe real, e caracterização de cada grupo etário.
